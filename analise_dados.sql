@@ -1,124 +1,208 @@
--- Criação do banco de dados
-CREATE DATABASE AnaliseDeDadosVendas;
+-- 1. Configurações
+CREATE DATABASE IF NOT EXISTS AnaliseDeDadosVendas
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_0900_ai_ci;
+
 USE AnaliseDeDadosVendas;
 
--- Tabela para armazenar informações de clientes
+-- =========================================================
+-- 📦 DIMENSÕES (Quem? Onde? O Que? Quando?)
+-- =========================================================
+
+-- DIMENSÃO TEMPO (Essencial para BI e Relatórios Rápidos)
+-- Permite queries como "Vendas em Finais de Semana" sem processamento pesado
+CREATE TABLE DimTempo (
+    data_id DATE PRIMARY KEY,
+    dia INT,
+    mes INT,
+    ano INT,
+    trimestre INT,
+    dia_semana VARCHAR(20),
+    eh_fim_de_semana BOOLEAN,
+    nome_mes VARCHAR(20)
+);
+
+-- DIMENSÃO CLIENTE (Com Segmentação RFM)
 CREATE TABLE Clientes (
     cliente_id INT AUTO_INCREMENT PRIMARY KEY,
     nome VARCHAR(100) NOT NULL,
     email VARCHAR(100) UNIQUE,
-    telefone VARCHAR(20),
-    data_cadastro DATETIME DEFAULT CURRENT_TIMESTAMP
+    cidade VARCHAR(50),
+    estado CHAR(2),
+    
+    -- Métricas Analíticas (Atualizadas via Procedure)
+    segmento_rfm ENUM('Novo', 'Promissor', 'Campeão', 'Em Risco', 'Perdido') DEFAULT 'Novo',
+    score_fidelidade DECIMAL(5,2) DEFAULT 0,
+    
+    data_cadastro DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_segmento (segmento_rfm)
 );
 
--- Tabela para armazenar informações de produtos
+-- DIMENSÃO PRODUTO
 CREATE TABLE Produtos (
     produto_id INT AUTO_INCREMENT PRIMARY KEY,
     nome VARCHAR(100) NOT NULL,
     categoria VARCHAR(50),
-    preco DECIMAL(10, 2) NOT NULL,
-    estoque INT NOT NULL CHECK (estoque >= 0),
-    data_cadastro DATETIME DEFAULT CURRENT_TIMESTAMP
+    sku VARCHAR(50) UNIQUE,
+    custo_atual DECIMAL(10, 2), -- Para cálculo de margem
+    preco_atual DECIMAL(10, 2) NOT NULL,
+    estoque_atual INT NOT NULL DEFAULT 0,
+    ativo BOOLEAN DEFAULT TRUE
 );
 
--- Tabela para armazenar informações de vendas
-CREATE TABLE Vendas (
-    venda_id INT AUTO_INCREMENT PRIMARY KEY,
+-- =========================================================
+-- 📈 FATOS E TRANSAÇÕES (O Acontecimento)
+-- =========================================================
+
+-- CABEÇALHO DO PEDIDO (Fato Venda)
+CREATE TABLE Pedidos (
+    pedido_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     cliente_id INT NOT NULL,
-    produto_id INT NOT NULL,
-    quantidade INT NOT NULL CHECK (quantidade > 0),
-    data_venda DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (cliente_id) REFERENCES Clientes(cliente_id) ON DELETE CASCADE,
-    FOREIGN KEY (produto_id) REFERENCES Produtos(produto_id) ON DELETE CASCADE
+    data_pedido DATETIME DEFAULT CURRENT_TIMESTAMP,
+    data_id DATE GENERATED ALWAYS AS (DATE(data_pedido)) STORED, -- Link para DimTempo
+    
+    valor_total DECIMAL(12, 2) DEFAULT 0.00,
+    status ENUM('Pendente', 'Pago', 'Cancelado') DEFAULT 'Pendente',
+    
+    FOREIGN KEY (cliente_id) REFERENCES Clientes(cliente_id),
+    FOREIGN KEY (data_id) REFERENCES DimTempo(data_id),
+    
+    INDEX idx_data_status (data_pedido, status) -- O índice mais usado em dashboards
 );
 
--- Índices para melhorar a performance
-CREATE INDEX idx_cliente_nome ON Clientes(nome);
-CREATE INDEX idx_produto_nome ON Produtos(nome);
-CREATE INDEX idx_venda_data ON Vendas(data_venda);
-CREATE INDEX idx_venda_cliente ON Vendas(cliente_id);
-CREATE INDEX idx_venda_produto ON Vendas(produto_id);
+-- DETALHE DO PEDIDO (Onde mora a verdade histórica)
+CREATE TABLE ItensPedido (
+    item_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    pedido_id BIGINT NOT NULL,
+    produto_id INT NOT NULL,
+    
+    quantidade INT NOT NULL,
+    
+    -- SNAPSHOTS (Preço congelado no momento da venda)
+    preco_unitario_venda DECIMAL(10, 2) NOT NULL,
+    custo_unitario_momento DECIMAL(10, 2) NOT NULL, -- Para saber o lucro real daquele dia
+    
+    subtotal DECIMAL(12, 2) GENERATED ALWAYS AS (quantidade * preco_unitario_venda) STORED,
+    margem_item DECIMAL(12, 2) GENERATED ALWAYS AS (subtotal - (quantidade * custo_unitario_momento)) STORED,
+    
+    FOREIGN KEY (pedido_id) REFERENCES Pedidos(pedido_id) ON DELETE CASCADE,
+    FOREIGN KEY (produto_id) REFERENCES Produtos(produto_id)
+);
 
--- View para analisar vendas por cliente
-CREATE VIEW ViewVendasPorCliente AS
-SELECT c.cliente_id, c.nome AS cliente, COUNT(v.venda_id) AS total_vendas, SUM(v.quantidade) AS total_quantidade, SUM(v.quantidade * p.preco) AS total_gasto
-FROM Clientes c
-LEFT JOIN Vendas v ON c.cliente_id = v.cliente_id
-LEFT JOIN Produtos p ON v.produto_id = p.produto_id
-GROUP BY c.cliente_id
-ORDER BY total_gasto DESC;
+-- =========================================================
+-- 🧠 PROCEDURES E INTEGRIDADE ANALÍTICA
+-- =========================================================
 
--- View para analisar vendas por produto
-CREATE VIEW ViewVendasPorProduto AS
-SELECT p.produto_id, p.nome AS produto, COUNT(v.venda_id) AS total_vendas, SUM(v.quantidade) AS total_vendido, SUM(v.quantidade * p.preco) AS total_faturado
-FROM Produtos p
-LEFT JOIN Vendas v ON p.produto_id = v.produto_id
-GROUP BY p.produto_id
-ORDER BY total_faturado DESC;
-
--- Função para calcular o faturamento total em um período específico
+-- PROCEDURE: Popular Dimensão Tempo (Executar uma vez para os próximos 10 anos)
 DELIMITER //
-CREATE FUNCTION FaturamentoTotal(inicio DATETIME, fim DATETIME) RETURNS DECIMAL(10, 2)
+CREATE PROCEDURE sp_PopularDimTempo(IN p_ano_inicio INT, IN p_ano_fim INT)
 BEGIN
-    DECLARE total DECIMAL(10, 2);
-    SELECT SUM(v.quantidade * p.preco) INTO total
-    FROM Vendas v
-    JOIN Produtos p ON v.produto_id = p.produto_id
-    WHERE v.data_venda BETWEEN inicio AND fim;
-    RETURN IFNULL(total, 0);
+    DECLARE v_data DATE;
+    SET v_data = DATE(CONCAT(p_ano_inicio, '-01-01'));
+    
+    WHILE YEAR(v_data) <= p_ano_fim DO
+        INSERT IGNORE INTO DimTempo (data_id, dia, mes, ano, trimestre, dia_semana, eh_fim_de_semana, nome_mes)
+        VALUES (
+            v_data, 
+            DAY(v_data), 
+            MONTH(v_data), 
+            YEAR(v_data), 
+            QUARTER(v_data), 
+            DAYNAME(v_data),
+            CASE WHEN DAYOFWEEK(v_data) IN (1, 7) THEN TRUE ELSE FALSE END,
+            MONTHNAME(v_data)
+        );
+        SET v_data = DATE_ADD(v_data, INTERVAL 1 DAY);
+    END WHILE;
 END //
 DELIMITER ;
 
--- Trigger para atualizar o estoque após uma venda
+-- TRIGGER: Congelar Preço e Atualizar Estoque
 DELIMITER //
-CREATE TRIGGER Trigger_AntesInserirVenda
-BEFORE INSERT ON Vendas
+CREATE TRIGGER trg_AntesInserirItem
+BEFORE INSERT ON ItensPedido
 FOR EACH ROW
 BEGIN
-    DECLARE estoque_atual INT;
-    SELECT estoque INTO estoque_atual FROM Produtos WHERE produto_id = NEW.produto_id;
-    IF estoque_atual < NEW.quantidade THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Estoque insuficiente para a venda.';
-    ELSE
-        UPDATE Produtos SET estoque = estoque - NEW.quantidade WHERE produto_id = NEW.produto_id;
+    DECLARE v_preco DECIMAL(10,2);
+    DECLARE v_custo DECIMAL(10,2);
+    DECLARE v_estoque INT;
+    
+    -- 1. Busca dados atuais do produto
+    SELECT preco_atual, custo_atual, estoque_atual 
+    INTO v_preco, v_custo, v_estoque
+    FROM Produtos WHERE produto_id = NEW.produto_id;
+    
+    -- 2. Validação de Estoque
+    IF v_estoque < NEW.quantidade THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Erro: Estoque insuficiente.';
     END IF;
+    
+    -- 3. O "Snapshot" (Congelamento de valores)
+    SET NEW.preco_unitario_venda = v_preco;
+    SET NEW.custo_unitario_momento = v_custo;
+    
+    -- 4. Baixa no Estoque
+    UPDATE Produtos SET estoque_atual = estoque_atual - NEW.quantidade 
+    WHERE produto_id = NEW.produto_id;
 END //
 DELIMITER ;
 
--- Inserção de exemplo de clientes
-INSERT INTO Clientes (nome, email, telefone) VALUES 
-('João Silva', 'joao.silva@example.com', '123456789'),
-('Maria Oliveira', 'maria.oliveira@example.com', '987654321'),
-('Pedro Santos', 'pedro.santos@example.com', '456123789');
+-- TRIGGER: Atualizar Total do Pedido
+DELIMITER //
+CREATE TRIGGER trg_AposInserirItem
+AFTER INSERT ON ItensPedido
+FOR EACH ROW
+BEGIN
+    UPDATE Pedidos 
+    SET valor_total = valor_total + NEW.subtotal 
+    WHERE pedido_id = NEW.pedido_id;
+END //
+DELIMITER ;
 
--- Inserção de exemplo de produtos
-INSERT INTO Produtos (nome, categoria, preco, estoque) VALUES 
-('Produto A', 'Categoria 1', 100.00, 50),
-('Produto B', 'Categoria 2', 150.00, 30),
-('Produto C', 'Categoria 1', 200.00, 20);
+-- PROCEDURE AVANÇADA: Análise RFM (Recency, Frequency, Monetary)
+-- Classifica clientes automaticamente baseado no comportamento de compra
+DELIMITER //
+CREATE PROCEDURE sp_CalcularRFM()
+BEGIN
+    -- Tabela temporária para scoring
+    CREATE TEMPORARY TABLE TempRFM AS
+    SELECT 
+        p.cliente_id,
+        DATEDIFF(NOW(), MAX(p.data_pedido)) AS recencia_dias, -- Há quanto tempo não compra
+        COUNT(DISTINCT p.pedido_id) AS frequencia_total, -- Quantas vezes comprou
+        SUM(p.valor_total) AS valor_monetario -- Quanto gastou
+    FROM Pedidos p
+    WHERE p.status = 'Pago'
+    GROUP BY p.cliente_id;
 
--- Inserção de exemplo de vendas
-INSERT INTO Vendas (cliente_id, produto_id, quantidade) VALUES 
-(1, 1, 2),
-(1, 2, 1),
-(2, 1, 3),
-(3, 2, 2),
-(2, 3, 1);
+    -- Atualiza tabela de clientes com segmentação
+    UPDATE Clientes c
+    JOIN TempRFM r ON c.cliente_id = r.cliente_id
+    SET c.segmento_rfm = CASE
+        WHEN r.valor_monetario > 5000 AND r.frequencia_total > 10 THEN 'Campeão'
+        WHEN r.recencia_dias > 90 AND r.valor_monetario > 1000 THEN 'Em Risco'
+        WHEN r.recencia_dias < 30 AND r.frequencia_total = 1 THEN 'Novo'
+        WHEN r.valor_monetario > 2000 THEN 'Promissor'
+        ELSE 'Promissor' -- Simplificação para o exemplo
+    END;
+    
+    DROP TEMPORARY TABLE TempRFM;
+END //
+DELIMITER ;
 
--- Selecionar vendas por cliente
-SELECT * FROM ViewVendasPorCliente;
-
--- Selecionar vendas por produto
-SELECT * FROM ViewVendasPorProduto;
-
--- Calcular faturamento total em um período específico
-SELECT FaturamentoTotal('2024-10-01', '2024-10-31') AS faturamento_outubro;
-
--- Excluir uma venda (isso atualiza o estoque automaticamente)
-DELETE FROM Vendas WHERE venda_id = 1;
-
--- Excluir um produto (isso falhará se o produto tiver vendas)
-DELETE FROM Produtos WHERE produto_id = 1;
-
--- Excluir um cliente (isso falhará se o cliente tiver vendas)
-DELETE FROM Clientes WHERE cliente_id = 1;
+-- VIEW: Dashboard Executivo (Lucro Real)
+CREATE OR REPLACE VIEW v_DashboardLucratividade AS
+SELECT 
+    t.ano,
+    t.nome_mes,
+    cat.categoria,
+    SUM(i.subtotal) AS faturamento_bruto,
+    SUM(i.margem_item) AS lucro_liquido,
+    CONCAT(ROUND((SUM(i.margem_item) / SUM(i.subtotal)) * 100, 1), '%') AS margem_percentual
+FROM ItensPedido i
+JOIN Pedidos p ON i.pedido_id = p.pedido_id
+JOIN DimTempo t ON p.data_id = t.data_id
+JOIN Produtos cat ON i.produto_id = cat.produto_id
+WHERE p.status = 'Pago'
+GROUP BY t.ano, t.mes, t.nome_mes, cat.categoria
+ORDER BY t.ano DESC, t.mes DESC;
